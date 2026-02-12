@@ -19,7 +19,7 @@ RELAY_AVATAR_URL = os.getenv("RELAY_AVATAR_URL", "")  # optional; leave blank fo
 
 # If True: if a message was never relayed (e.g., bot restarted) and then it gets edited,
 # the bot will create a relayed message at edit-time.
-CREATE_ON_EDIT_IF_MISSING = os.getenv("CREATE_ON_EDIT_IF_MISSING", "false").lower() in ("1", "true", "yes")
+CREATE_ON_EDIT_IF_MISSING = os.getenv("CREATE_ON_EDIT_IF_MISSING", "true").lower() in ("1", "true", "yes")
 
 if not DISCORD_TOKEN or SOURCE_CHANNEL_ID == 0 or not DEST_WEBHOOK_URL:
     raise SystemExit("Missing env vars. Set DISCORD_TOKEN, SOURCE_CHANNEL_ID, DEST_WEBHOOK_URL.")
@@ -65,7 +65,6 @@ def build_relay_content(msg: discord.Message) -> str:
         urls = [a.url for a in msg.attachments]
         content = (content + "\n\n" if content else "") + "\n".join(urls)
 
-    # Discord content limit
     return content[:2000].strip()
 
 
@@ -130,12 +129,11 @@ async def relay_edit(relayed_id: int, new_content: str):
 async def on_ready():
     print(f"Logged in as {client.user} (id={client.user.id})")
     print("RELAY_USERNAME =", RELAY_USERNAME)
+    print("CREATE_ON_EDIT_IF_MISSING =", CREATE_ON_EDIT_IF_MISSING)
     if ALLOWED_SOURCE_WEBHOOK_URL and not ALLOWED_SOURCE_WEBHOOK_ID:
         print("WARNING: ALLOWED_SOURCE_WEBHOOK_URL is set but couldn't parse its webhook id.")
     if not DEST_WEBHOOK_ID:
         print("WARNING: Couldn't parse DEST_WEBHOOK_URL webhook id (loop protection reduced).")
-    if CREATE_ON_EDIT_IF_MISSING:
-        print("CREATE_ON_EDIT_IF_MISSING is ENABLED")
 
 
 @client.event
@@ -148,51 +146,64 @@ async def on_message(message: discord.Message):
         return
 
     relay_map[message.id] = relayed_id
+    print(f"RELayed message: source={message.id} dest={relayed_id}")
 
 
 @client.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
-    # Only care about edits in the source channel we relay
+    print("EDIT EVENT FIRED:", after.id, "channel=", after.channel.id, "webhook_id=", after.webhook_id)
+
     if after.channel.id != SOURCE_CHANNEL_ID:
+        print("EDIT IGNORED (wrong channel)")
         return
 
     if not should_relay_message(after):
+        print("EDIT IGNORED (should_relay_message false)")
         return
 
-    # Fetch the latest message to ensure we have updated content/attachments
+    # Fetch latest to ensure updated content/attachments
     try:
         fresh = await after.channel.fetch_message(after.id)
-    except Exception:
+        print("FETCHED FRESH MESSAGE OK")
+    except Exception as e:
         fresh = after
+        print("FETCH FAILED, using 'after':", repr(e))
 
     new_content = build_relay_content(fresh)
+    print("NEW CONTENT LEN:", len(new_content))
+
     if not new_content:
+        print("EDIT IGNORED (empty content)")
         return
 
     relayed_id = relay_map.get(after.id)
+    print("MAPPED RELAY ID:", relayed_id)
 
-    # If we never relayed the original (e.g., bot restarted), optionally create on edit
     if not relayed_id:
         if not CREATE_ON_EDIT_IF_MISSING:
+            print("NO MAPPING and CREATE_ON_EDIT_IF_MISSING is false -> cannot update")
             return
         relayed_id = await relay_send_from_message(fresh)
         if relayed_id is None:
+            print("CREATE ON EDIT FAILED (no relayed id)")
             return
         relay_map[after.id] = relayed_id
-        print(f"Created relay on edit: source={after.id} dest={relayed_id}")
+        print(f"CREATED RELAY ON EDIT: source={after.id} dest={relayed_id}")
         return
 
     try:
         await relay_edit(relayed_id, new_content)
-        print(f"Updated relay on edit: source={after.id} dest={relayed_id}")
+        print(f"UPDATED RELAY ON EDIT: source={after.id} dest={relayed_id}")
     except discord.NotFound:
         relay_map.pop(after.id, None)
+        print("EDIT FAILED: destination message not found (maybe deleted)")
+    except discord.Forbidden:
+        print("EDIT FAILED: forbidden (webhook can't edit that message)")
     except Exception as e:
-        print("Edit failed:", repr(e))
+        print("EDIT FAILED:", repr(e))
 
 
 # ====== WEB SERVER FOR RENDER KEEP-ALIVE ======
-
 async def create_app() -> web.Application:
     app = web.Application()
 
